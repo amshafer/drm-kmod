@@ -16,6 +16,11 @@
 #include "i915_drv.h"
 #include "i915_reg.h"
 
+#ifdef __FreeBSD__
+#include <dev/mei/mei.h>
+static int freebsd_gsc_proxy_late_bind(struct intel_gsc_uc *gsc);
+#endif
+
 /*
  * GSC proxy:
  * The GSC uC needs to communicate with the CSME to perform certain operations.
@@ -262,6 +267,18 @@ int intel_gsc_proxy_request_handler(struct intel_gsc_uc *gsc)
 
 	assert_rpm_wakelock_held(gt->uncore->rpm);
 
+#ifdef __FreeBSD__
+	/*
+	 * On FreeBSD the component bind is deferred until after GuC firmware
+	 * has loaded (see freebsd_gsc_proxy_init comment).  Perform it now.
+	 */
+	err = freebsd_gsc_proxy_late_bind(gsc);
+	if (err) {
+		gt_err(gt, "GSC proxy late bind failed (%d)\n", err);
+		return err;
+	}
+#endif
+
 	/* when GSC is loaded, we can queue this before the component is bound */
 	err = wait_for(gsc->proxy.component, GSC_PROXY_INIT_TIMEOUT_MS);
 	if (err) {
@@ -305,7 +322,6 @@ void intel_gsc_proxy_irq_handler(struct intel_gsc_uc *gsc, u32 iir)
 	queue_work(gsc->wq, &gsc->work);
 }
 
-#ifdef __linux__
 static int i915_gsc_proxy_component_bind(struct device *i915_kdev,
 					 struct device *mei_kdev, void *data)
 {
@@ -347,11 +363,133 @@ static void i915_gsc_proxy_component_unbind(struct device *i915_kdev,
 	gt_dbg(gt, "GSC proxy mei component unbound\n");
 }
 
+#ifdef __linux__
 static const struct component_ops i915_gsc_proxy_component_ops = {
 	.bind   = i915_gsc_proxy_component_bind,
 	.unbind = i915_gsc_proxy_component_unbind,
 };
 #endif
+
+#ifdef __FreeBSD__
+
+/*
+ * FreeBSD MEI GSC proxy bridge.
+ *
+ * On FreeBSD we bypass the Linux component framework and directly wire
+ * the native MEI driver's send/recv functions into the i915 GSC proxy
+ * component interface.
+ */
+
+static device_t freebsd_mei_dev;
+
+static int
+freebsd_gsc_proxy_send(struct device *dev, const void *buf, size_t size)
+{
+	if (freebsd_mei_dev == NULL)
+		return -ENODEV;
+	return mei_gsc_proxy_send(freebsd_mei_dev, buf, size);
+}
+
+static int
+freebsd_gsc_proxy_recv(struct device *dev, void *buf, size_t size)
+{
+	if (freebsd_mei_dev == NULL)
+		return -ENODEV;
+	return mei_gsc_proxy_recv(freebsd_mei_dev, buf, size);
+}
+
+static const struct i915_gsc_proxy_component_ops freebsd_gsc_proxy_ops = {
+	.owner = NULL,
+	.send = freebsd_gsc_proxy_send,
+	.recv = freebsd_gsc_proxy_recv,
+};
+
+static struct i915_gsc_proxy_component *freebsd_proxy_comp;
+
+/*
+ * Check that MEI is available but don't bind yet.  The actual bind
+ * is deferred to freebsd_gsc_proxy_late_bind() because
+ * i915_gsc_proxy_component_bind() writes to GPU HECI2 registers on
+ * the media GT.  If we do that during intel_gsc_proxy_init() (which
+ * runs in __uc_init, before __uc_init_hw), we disturb the GT1
+ * hardware state before GuC firmware has been loaded, causing RSA
+ * signature verification failures.
+ *
+ * On Linux the component framework calls bind asynchronously after
+ * both drivers are loaded, so the bind naturally happens after
+ * __uc_init_hw.  On FreeBSD we replicate that by deferring the bind
+ * to the GSC work thread (via intel_gsc_proxy_request_handler's
+ * wait_for loop).
+ */
+static int
+freebsd_gsc_proxy_init(struct intel_gsc_uc *gsc)
+{
+	device_t mei_dev;
+    gt_err(gsc_uc_to_gt(gsc), "freebsd_gsc_proxy_init: enter");
+
+	mei_dev = mei_find_gsc_proxy_device();
+	if (mei_dev == NULL) {
+		gt_info(gsc_uc_to_gt(gsc),
+		    "MEI device not found, GSC proxy unavailable\n");
+		return -ENODEV;
+	}
+
+	freebsd_mei_dev = mei_dev;
+	/* component_added will be set by the caller; the actual bind
+	 * happens later in freebsd_gsc_proxy_late_bind(). */
+	return 0;
+}
+
+/*
+ * Perform the deferred bind.  Called from a work context after GuC
+ * firmware has been loaded and the GSC work thread needs the proxy.
+ */
+static int
+freebsd_gsc_proxy_late_bind(struct intel_gsc_uc *gsc)
+{
+	struct intel_gt *gt = gsc_uc_to_gt(gsc);
+	struct drm_i915_private *i915 = gt->i915;
+	int err;
+    gt_err(gt, "freebsd_gsc_proxy_late_bind: enter");
+
+	if (freebsd_mei_dev == NULL)
+		return -ENODEV;
+
+	if (freebsd_proxy_comp != NULL)
+		return 0; /* already bound */
+
+	freebsd_proxy_comp = kzalloc(sizeof(*freebsd_proxy_comp), GFP_KERNEL);
+	if (freebsd_proxy_comp == NULL)
+		return -ENOMEM;
+
+	freebsd_proxy_comp->ops = &freebsd_gsc_proxy_ops;
+
+	err = i915_gsc_proxy_component_bind(i915->drm.dev, NULL,
+	    freebsd_proxy_comp);
+	if (err) {
+		kfree(freebsd_proxy_comp);
+		freebsd_proxy_comp = NULL;
+		return err;
+	}
+
+	return 0;
+}
+
+static void
+freebsd_gsc_proxy_unbind(struct intel_gsc_uc *gsc)
+{
+	struct intel_gt *gt = gsc_uc_to_gt(gsc);
+	struct drm_i915_private *i915 = gt->i915;
+
+	if (freebsd_proxy_comp != NULL) {
+		i915_gsc_proxy_component_unbind(i915->drm.dev, NULL,
+		    freebsd_proxy_comp);
+		kfree(freebsd_proxy_comp);
+		freebsd_proxy_comp = NULL;
+	}
+	freebsd_mei_dev = NULL;
+}
+#endif /* __FreeBSD__ */
 
 static int proxy_channel_alloc(struct intel_gsc_uc *gsc)
 {
@@ -391,6 +529,9 @@ void intel_gsc_proxy_fini(struct intel_gsc_uc *gsc)
 
 	if (fetch_and_zero(&gsc->proxy.component_added))
 		component_del(i915->drm.dev, &i915_gsc_proxy_component_ops);
+#elif defined(__FreeBSD__)
+	if (fetch_and_zero(&gsc->proxy.component_added))
+		freebsd_gsc_proxy_unbind(gsc);
 #endif
 
 	proxy_channel_free(gsc);
@@ -406,10 +547,12 @@ int intel_gsc_proxy_init(struct intel_gsc_uc *gsc)
 
 	mutex_init(&gsc->proxy.mutex);
 
+#ifdef __linux__
 	if (!IS_ENABLED(CONFIG_INTEL_MEI_GSC_PROXY)) {
 		gt_info(gt, "can't init GSC proxy due to missing mei component\n");
 		return -ENODEV;
 	}
+#endif
 
 	err = proxy_channel_alloc(gsc);
 	if (err)
@@ -419,7 +562,7 @@ int intel_gsc_proxy_init(struct intel_gsc_uc *gsc)
 	err = component_add_typed(i915->drm.dev, &i915_gsc_proxy_component_ops,
 				  I915_COMPONENT_GSC_PROXY);
 #elif defined(__FreeBSD__)
-	err = -ENOTSUP;
+	err = freebsd_gsc_proxy_init(gsc);
 #endif
 	if (err < 0) {
 		gt_err(gt, "Failed to add GSC_PROXY component (%d)\n", err);
